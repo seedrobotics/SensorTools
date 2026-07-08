@@ -1,0 +1,7 @@
+pyinstaller --onefile --windowed --name SensorTool --icon logo.ico --add-data "logo.png;." SensorTool.py
+
+# Linux build (path separator in --add-data is ':' instead of ';'):
+# pyinstaller --onefile --windowed --name SensorTool --add-data "logo.png:." SensorTool.py
+
+# One-time: create logo.ico from logo.png (needs: pip install pillow)
+# python -c "from PIL import Image; Image.open('logo.png').save('logo.ico', sizes=[(16,16),(24,24),(32,32),(48,48),(64,64),(128,128),(256,256)])"

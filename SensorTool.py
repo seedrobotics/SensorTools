@@ -1,10 +1,22 @@
 import sys
+import os
 import serial
 import serial.tools.list_ports
 import csv
 import time
 from datetime import datetime
 import socket
+
+
+def resource_path(name):
+    """
+    Return the absolute path of a bundled resource file.
+
+    Works both when running as a plain script (file next to SensorTool.py)
+    and inside a PyInstaller onefile exe (file unpacked to sys._MEIPASS).
+    """
+    base = getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(base, name)
 
 
 def findport():
@@ -201,7 +213,7 @@ class SensorTool():
         import threading
         from collections import deque
         from pathlib import Path
-        from PySide6 import QtWidgets, QtCore
+        from PySide6 import QtWidgets, QtCore, QtGui
         import pyqtgraph as pg
 
         BUFFER_SIZE = 500
@@ -344,6 +356,15 @@ class SensorTool():
         ]
 
         app = QtWidgets.QApplication.instance() or QtWidgets.QApplication(sys.argv)
+
+        icon_file = resource_path("logo.png")
+        if os.path.exists(icon_file):
+            if sys.platform == "win32":
+                # Give the process its own taskbar identity so Windows shows
+                # our icon instead of grouping under the generic Python one
+                import ctypes
+                ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID("seedrobotics.sensortool")
+            app.setWindowIcon(QtGui.QIcon(icon_file))
 
         win = QtWidgets.QWidget()
         win.setWindowTitle("FTS Sensor Monitor")
