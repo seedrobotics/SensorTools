@@ -336,7 +336,8 @@ class SensorTool():
                                             csvfile.flush()
                                             last_flush = now
                                     try:
-                                        data_queue.put_nowait([float(v) for v in fields])
+                                        # empty fields (sensor slot not connected) become NaN
+                                        data_queue.put_nowait([float(v) if v.strip() else float("nan") for v in fields])
                                     except (ValueError, queue.Full):
                                         pass
                                 elif now - last_data > 3.0:
@@ -350,8 +351,9 @@ class SensorTool():
             finally:
                 stop_recording()
 
+        # NaN-filled so unconnected sensors draw nothing instead of a fake 0-line
         buffers = [
-            [deque([0.0] * BUFFER_SIZE, maxlen=BUFFER_SIZE) for _ in AXES]
+            [deque([float("nan")] * BUFFER_SIZE, maxlen=BUFFER_SIZE) for _ in AXES]
             for _ in range(NUM_SENSORS)
         ]
 
@@ -473,8 +475,15 @@ class SensorTool():
         ctrl_layout.addSpacing(6)
         ctrl_layout.addWidget(QtWidgets.QLabel("<b>Sensors</b>"))
 
+        INACTIVE_COLOR = '#9e9e9e'
+
+        def sensor_btn_style(color):
+            return (f"QPushButton {{ color: {color}; font-weight: bold; "
+                    f"text-align: left; border: none; padding: 2px 0px; }}")
+
         sensor_axis_checks = []
         sensor_master_checks = []
+        sensor_buttons = []
         for s in range(NUM_SENSORS):
             row_widget = QtWidgets.QWidget()
             row_layout = QtWidgets.QHBoxLayout(row_widget)
@@ -489,10 +498,8 @@ class SensorTool():
 
             btn = QtWidgets.QPushButton(f"▶  Sensor {s + 1}")
             btn.setCheckable(True)
-            btn.setStyleSheet(
-                f"QPushButton {{ color: {SENSOR_COLORS[s]}; font-weight: bold; "
-                f"text-align: left; border: none; padding: 2px 0px; }}"
-            )
+            btn.setStyleSheet(sensor_btn_style(SENSOR_COLORS[s]))
+            sensor_buttons.append(btn)
             row_layout.addWidget(btn, stretch=1)
             ctrl_layout.addWidget(row_widget)
 
@@ -547,6 +554,7 @@ class SensorTool():
                 plot_widget.plot(
                     pen=pg.mkPen(color=SENSOR_COLORS[s], style=AXIS_STYLES[a], width=1.5),
                     clipToView=True,
+                    connect="finite",  # NaN samples become gaps instead of spikes
                 )
                 for a in range(len(AXES))
             ]
@@ -565,6 +573,21 @@ class SensorTool():
         MIN_DISPLAY_SPAN = MIN_Y_RANGE  # hard floor — raise this to reduce lag at tight scales
         SHRINK_FRAMES = 20
         y_state = {'lo': -MIN_Y_RANGE / 2, 'hi': MIN_Y_RANGE / 2, 'shrink_count': 0}
+
+        # Sensors whose fields arrive empty (not connected) get greyed out
+        sensor_active = [True] * NUM_SENSORS
+
+        def apply_sensor_activity(active):
+            for s in range(NUM_SENSORS):
+                if active[s] == sensor_active[s]:
+                    continue
+                sensor_active[s] = active[s]
+                sensor_master_checks[s].setEnabled(active[s])
+                for cb in sensor_axis_checks[s]:
+                    cb.setEnabled(active[s])
+                color = SENSOR_COLORS[s] if active[s] else INACTIVE_COLOR
+                sensor_buttons[s].setStyleSheet(sensor_btn_style(color))
+                sensor_buttons[s].setToolTip("" if active[s] else "No data — sensor not connected")
 
         def _maybe_rescale(dmin, dmax):
             center = (dmin + dmax) / 2
@@ -612,17 +635,25 @@ class SensorTool():
                 #record_btn.setText(f"⏹ ({elapsed // 60}:{elapsed % 60:02d} · {rec_state['rows']} rows)")
 
             changed = False
+            latest_active = None
             while True:
                 try:
                     data = data_queue.get_nowait()
+                    latest_active = [False] * NUM_SENSORS
                     for s in range(NUM_SENSORS):
                         for a in range(len(AXES)):
                             idx = offset + s * 3 + a
-                            if idx < len(data):
-                                buffers[s][a].append(data[idx])
+                            # missing/empty fields buffer as NaN so time stays aligned
+                            val = data[idx] if idx < len(data) else float("nan")
+                            buffers[s][a].append(val)
+                            if not math.isnan(val):
+                                latest_active[s] = True
                     changed = True
                 except queue.Empty:
                     break
+
+            if latest_active is not None:
+                apply_sensor_activity(latest_active)
 
             glb_min = float('inf')
             glb_max = float('-inf')
@@ -633,10 +664,12 @@ class SensorTool():
                     if visible and changed:
                         arr = np.array(buffers[s][a])
                         curves[s][a].setData(arr)
-                        a_min = float(arr.min())
-                        a_max = float(arr.max())
-                        if a_min < glb_min: glb_min = a_min
-                        if a_max > glb_max: glb_max = a_max
+                        finite = arr[np.isfinite(arr)]
+                        if finite.size:
+                            a_min = float(finite.min())
+                            a_max = float(finite.max())
+                            if a_min < glb_min: glb_min = a_min
+                            if a_max > glb_max: glb_max = a_max
 
             _frame_times.append(_time.monotonic())
             if len(_frame_times) >= 2:
