@@ -587,7 +587,8 @@ class SensorTool():
                 QtWidgets.QMessageBox.warning(win, "Recording failed", error_msg)
             elif rec_ui['started'] is not None:
                 elapsed = int(_time.monotonic() - rec_ui['started'])
-                record_btn.setText(f"⏹ Stop ({elapsed // 60}:{elapsed % 60:02d} · {rec_state['rows']} rows)")
+                record_btn.setText(f"⏹ Stop ({elapsed // 60}:{elapsed % 60:02d})")
+                #record_btn.setText(f"⏹ ({elapsed // 60}:{elapsed % 60:02d} · {rec_state['rows']} rows)")
 
             changed = False
             while True:
