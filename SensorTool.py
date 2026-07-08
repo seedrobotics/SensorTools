@@ -28,7 +28,7 @@ def findport():
                 if loc.endswith(":1.1"):
                     return port.device
             else:
-                if port.serial_number[-1] == "B":
+                if port.serial_number and port.serial_number[-1] == "B":
                     return port.device
     print("No fitting device found")
     return None
@@ -52,6 +52,7 @@ class SensorTool():
         https://kb.seedrobotics.com/doku.php?id=fts:fts3_pressuresensor
 
     Usage examples:
+        python3 SensorTool.py              # no args -> GUI (double-click friendly)
         python3 SensorTool.py print
         python3 SensorTool.py csv --port /dev/ttyUSB0
         python3 SensorTool.py udp --udp-ip 192.168.1.10 --udp-port 6000
@@ -188,11 +189,18 @@ class SensorTool():
     def fts_gui(self):
         """
         Open a live PySide6/pyqtgraph window that plots all sensor axes in real time.
+
+        The window opens even with no sensor attached: a reader thread keeps
+        scanning for the device, auto-reconnects (with full re-init) if the
+        connection drops, and reports its state in the control panel. A port
+        dropdown allows manual selection if auto-detection fails, and a Record
+        button writes incoming samples to a CSV file (same format as csv mode).
         """
         import sys
         import queue
         import threading
         from collections import deque
+        from pathlib import Path
         from PySide6 import QtWidgets, QtCore
         import pyqtgraph as pg
 
@@ -211,37 +219,124 @@ class SensorTool():
         offset = 2 if self.timestamps else 0
 
         data_queue = queue.Queue(maxsize=2000)
+        status_queue = queue.Queue()
+        record_queue = queue.Queue()
         stop_event = threading.Event()
         calibrate_event = threading.Event()
+        reconnect_event = threading.Event()
         period_queue = queue.Queue(maxsize=1)
+        # Shared with the reader thread; single-key dicts to allow closure writes
+        port_selection = {'value': self.com_port or "auto"}
+        current_period = {'value': 20}
+        rec_state = {'rows': 0, 'error': None}
 
         def serial_reader():
+            csvfile = None
+            writer = None
+            last_flush = 0.0
+
+            def stop_recording():
+                nonlocal csvfile, writer
+                if csvfile:
+                    csvfile.close()
+                csvfile = None
+                writer = None
+
+            def start_recording(filename):
+                nonlocal csvfile, writer
+                stop_recording()
+                try:
+                    csvfile = open(filename, "w", newline="")
+                except OSError as e:
+                    rec_state['error'] = str(e)
+                    return
+                writer = csv.writer(csvfile)
+                if self.timestamps:
+                    writer.writerow(["Time: s", "Time: ms"] + [f"{a}{i}" for i in range(1, 6) for a in "xyz"])
+                else:
+                    writer.writerow([f"{a}{i}" for i in range(1, 6) for a in "xyz"])
+                csvfile.flush()
+                rec_state['rows'] = 0
+
+            def handle_record_commands():
+                while True:
+                    try:
+                        cmd = record_queue.get_nowait()
+                    except queue.Empty:
+                        return
+                    if cmd[0] == "start":
+                        start_recording(cmd[1])
+                    else:
+                        stop_recording()
+
             try:
-                with serial.Serial(self.com_port, self.baud, timeout=1) as ser:
-                    ser.write(("enabletime" if self.timestamps else "disabletime").encode())
-                    time.sleep(0.3)
-                    if self.auto_calibrate:
-                        ser.write(b"calibrate")
-                    time.sleep(0.3)
-                    ser.reset_input_buffer()
-                    while not stop_event.is_set():
-                        if calibrate_event.is_set():
-                            ser.write(b"calibrate")
-                            calibrate_event.clear()
-                        try:
-                            period_val = period_queue.get_nowait()
-                            ser.write(f"setperiod,{period_val}".encode())
-                        except queue.Empty:
-                            pass
-                        line = ser.readline()
-                        if line:
-                            fields = line.decode("utf-8", errors="replace").rstrip().split(",")
-                            try:
-                                data_queue.put_nowait([float(v) for v in fields[1:-1]])
-                            except (ValueError, queue.Full):
-                                pass
-            except Exception as e:
-                print(f"Serial error: {e}")
+                while not stop_event.is_set():
+                    handle_record_commands()
+                    reconnect_event.clear()
+                    port = port_selection['value']
+                    if port == "auto":
+                        port = findport()
+                    if port is None:
+                        status_queue.put(("searching", None))
+                        if stop_event.wait(1.0):
+                            break
+                        continue
+                    try:
+                        with serial.Serial(port, self.baud, timeout=1) as ser:
+                            # Full init on every (re)connect: the sensor may have
+                            # power-cycled and lost its epoch/period state.
+                            if self.timestamps:
+                                ser.write(b"enabletime")
+                                time.sleep(0.3)
+                                ser.write(f"setepoch,{time.time()},0".encode())
+                            else:
+                                ser.write(b"disabletime")
+                            time.sleep(0.3)
+                            if self.auto_calibrate:
+                                ser.write(b"calibrate")
+                            time.sleep(0.3)
+                            ser.write(f"setperiod,{current_period['value']}".encode())
+                            time.sleep(0.3)
+                            ser.reset_input_buffer()
+                            status_queue.put(("connected", port))
+                            last_data = time.monotonic()
+                            while not stop_event.is_set():
+                                handle_record_commands()
+                                if reconnect_event.is_set():
+                                    raise serial.SerialException("port changed by user")
+                                if calibrate_event.is_set():
+                                    ser.write(b"calibrate")
+                                    calibrate_event.clear()
+                                try:
+                                    period_val = period_queue.get_nowait()
+                                    ser.write(f"setperiod,{period_val}".encode())
+                                except queue.Empty:
+                                    pass
+                                line = ser.readline()
+                                now = time.monotonic()
+                                if line:
+                                    last_data = now
+                                    fields = line.decode("utf-8", errors="replace").rstrip().split(",")[1:-1]
+                                    if writer:
+                                        writer.writerow(fields)
+                                        rec_state['rows'] += 1
+                                        if now - last_flush > 1.0:
+                                            csvfile.flush()
+                                            last_flush = now
+                                    try:
+                                        data_queue.put_nowait([float(v) for v in fields])
+                                    except (ValueError, queue.Full):
+                                        pass
+                                elif now - last_data > 3.0:
+                                    # Unplugging doesn't always raise on Windows; a port
+                                    # silent past the max sample period means the link died.
+                                    raise serial.SerialException("no data for 3 s")
+                    except (serial.SerialException, OSError):
+                        status_queue.put(("lost", None))
+                        if stop_event.wait(1.0):
+                            break
+            finally:
+                stop_recording()
 
         buffers = [
             [deque([0.0] * BUFFER_SIZE, maxlen=BUFFER_SIZE) for _ in AXES]
@@ -266,28 +361,86 @@ class SensorTool():
         ctrl_layout.setAlignment(QtCore.Qt.AlignmentFlag.AlignTop)
         ctrl_layout.setSpacing(6)
 
-        ctrl_layout.addWidget(QtWidgets.QLabel(f"Port: <b>{self.com_port}</b>"))
+        ctrl_layout.addWidget(QtWidgets.QLabel("Port"))
+
+        def refresh_ports():
+            desired = port_selection['value']
+            port_combo.blockSignals(True)
+            port_combo.clear()
+            port_combo.addItem("Auto", "auto")
+            for p in serial.tools.list_ports.comports():
+                port_combo.addItem(p.device, p.device)
+            if desired != "auto" and port_combo.findData(desired) < 0:
+                port_combo.addItem(desired, desired)
+            port_combo.setCurrentIndex(max(port_combo.findData(desired), 0))
+            port_combo.blockSignals(False)
+
+        class _PortCombo(QtWidgets.QComboBox):
+            def showPopup(self):
+                refresh_ports()
+                super().showPopup()
+
+        port_combo = _PortCombo()
+        refresh_ports()
+
+        def on_port_changed(index):
+            port_selection['value'] = port_combo.itemData(index)
+            reconnect_event.set()
+
+        port_combo.currentIndexChanged.connect(on_port_changed)
+        ctrl_layout.addWidget(port_combo)
+
+        status_label = QtWidgets.QLabel("Searching for sensor…")
+        status_label.setWordWrap(True)
+        status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
+        ctrl_layout.addWidget(status_label)
 
         fps_label = QtWidgets.QLabel("FPS: --")
         fps_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        ctrl_layout.addWidget(fps_label)
+        #ctrl_layout.addWidget(fps_label)
 
         calibrate_btn = QtWidgets.QPushButton("Calibrate")
         calibrate_btn.setStyleSheet("QPushButton { padding: 4px; }")
         calibrate_btn.clicked.connect(calibrate_event.set)
         ctrl_layout.addWidget(calibrate_btn)
 
+        record_btn = QtWidgets.QPushButton("⏺ Record CSV")
+        record_btn.setCheckable(True)
+        record_btn.setStyleSheet("QPushButton { padding: 4px; }")
+        rec_ui = {'started': None}
+
+        def on_record_toggled(checked):
+            if checked:
+                docs = Path.home() / "Documents"
+                base = docs if docs.is_dir() else Path.home()
+                default = str(base / datetime.now().strftime("sensor_data_%Y-%m-%d_%H-%M-%S.csv"))
+                filename, _ = QtWidgets.QFileDialog.getSaveFileName(
+                    win, "Save sensor recording", default, "CSV files (*.csv)")
+                if not filename:
+                    record_btn.setChecked(False)
+                    return
+                record_queue.put(("start", filename))
+                rec_ui['started'] = time.monotonic()
+            else:
+                record_queue.put(("stop",))
+                rec_ui['started'] = None
+                record_btn.setText("⏺ Record CSV")
+
+        record_btn.toggled.connect(on_record_toggled)
+        ctrl_layout.addWidget(record_btn)
+
         ctrl_layout.addWidget(QtWidgets.QLabel("Period (ms)"))
         period_slider = QtWidgets.QSlider(QtCore.Qt.Orientation.Horizontal)
         period_slider.setRange(20, 1000)
         period_slider.setValue(20)
-        ctrl_layout.addWidget(period_slider)
+        #ctrl_layout.addWidget(period_slider)
         period_label = QtWidgets.QLabel("20")
         period_label.setAlignment(QtCore.Qt.AlignmentFlag.AlignCenter)
-        ctrl_layout.addWidget(period_label)
+        #ctrl_layout.addWidget(period_label)
 
         def on_period_changed(val):
             period_label.setText(str(val))
+            current_period['value'] = val  # re-sent by the reader on reconnect
             try:
                 period_queue.get_nowait()
             except queue.Empty:
@@ -413,6 +566,29 @@ class SensorTool():
                 y_state['shrink_count'] = 0
 
         def update():
+            try:
+                while True:
+                    state, info = status_queue.get_nowait()
+                    if state == "connected":
+                        status_label.setText(f"Connected: {info}")
+                        status_label.setStyleSheet("color: #2ecc71; font-weight: bold;")
+                    elif state == "searching":
+                        status_label.setText("Searching for sensor…")
+                        status_label.setStyleSheet("color: #f39c12; font-weight: bold;")
+                    else:
+                        status_label.setText("Connection lost — reconnecting…")
+                        status_label.setStyleSheet("color: #e74c3c; font-weight: bold;")
+            except queue.Empty:
+                pass
+
+            if rec_state['error']:
+                record_btn.setChecked(False)
+                error_msg, rec_state['error'] = rec_state['error'], None
+                QtWidgets.QMessageBox.warning(win, "Recording failed", error_msg)
+            elif rec_ui['started'] is not None:
+                elapsed = int(_time.monotonic() - rec_ui['started'])
+                record_btn.setText(f"⏹ Stop ({elapsed // 60}:{elapsed % 60:02d} · {rec_state['rows']} rows)")
+
             changed = False
             while True:
                 try:
@@ -452,20 +628,24 @@ class SensorTool():
         timer.timeout.connect(update)
         timer.start(50)  # 20 Hz refresh
 
-        threading.Thread(target=serial_reader, daemon=True).start()
+        reader_thread = threading.Thread(target=serial_reader, daemon=True)
+        reader_thread.start()
 
         win.show()
         try:
             app.exec()
         finally:
             stop_event.set()
+            # let the reader finish its cycle and close any open recording
+            reader_thread.join(timeout=3.0)
 
 
 if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(description="Seed robotics sensor data writer")
-    parser.add_argument("mode", choices=["print", "csv", "udp", "gui"], help="Output mode")
+    parser.add_argument("mode", nargs="?", choices=["print", "csv", "udp", "gui"], default="gui",
+                        help="Output mode (default: gui, so a double-clicked exe opens the GUI)")
     parser.add_argument("--port", default="auto", help="Serial port (default: auto)")
     parser.add_argument("--no-timestamps", action="store_true", help="Disable timestamps")
     parser.add_argument("--no-calibrate", action="store_true", help="Skip auto-calibration")
@@ -479,6 +659,10 @@ if __name__ == "__main__":
         timestamps=not args.no_timestamps,
         auto_calibrate=not args.no_calibrate,
     )
+
+    # GUI keeps scanning on its own; the one-shot CLI modes need a port up front
+    if args.mode != "gui" and writer.com_port is None:
+        sys.exit("Error: no sensor found. Specify the serial port with --port.")
 
     if args.mode == "print":
         writer.fts_print()
